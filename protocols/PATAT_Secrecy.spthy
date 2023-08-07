@@ -1,0 +1,824 @@
+/*
+ *  We use the following Noise Protocol
+ *
+ *  <- s
+ *  ...
+ *  -> e, es
+ *  <- e, ee
+ *  -> s, se
+ *
+ *  Author: Frank Nijeboer
+ *  Model Name: PATAT_Secrecy.spthy
+ *  Status: DEVELOPMENTAL
+ *
+ *  Comments:
+ */
+
+theory PATAT_Secrecy
+begin
+
+builtins: hashing, diffie-hellman
+functions: aead/4, verify/4, decrypt/4, true/0, hmac/2
+equations: decrypt(aead(k, n, a, p), k, n, a) = p
+equations: verify(aead(k, n, a, p), k, n, a) = true
+
+restriction Equality:
+"All a b #i. Equal(a, b)@i ==> a = b"
+
+/* ---Keypair Functions--- */
+rule create_static_key_pair:
+	let
+		public_key = 'g'^~private_key
+	in
+		// Generate a new private key which is random
+		[ Fr(~private_key) ]
+	-->
+		[
+			// Create the keypair to link the keys
+			!KeyPair(public_key, ~private_key),
+
+			// Output the public key to the network
+			Out(public_key)
+		]
+
+/* We have to provide the attacker with some possibility
+ * to get the static private key to find attacks and
+ * help in making assumptions on the protocol. Therefore,
+ * we include this rule here
+ */
+rule reveal_private_key:
+		[ !KeyPair(public_key, ~private_key) ]
+	--[ RevealSecretKey(public_key) ]->
+		// Output the private key to the network
+		// and thus make it available to the attacker
+		[ Out(~private_key)]
+
+/* We also want the attacker to be able to get the private key
+ * of the ephemeral keypair. In practice, it would be hard to leak
+ * this key, but we include it for completeness sake.
+ */
+rule reveal_ephemeral_key:
+		[ !EphemeralKey(~id, public_key, ~private_key) ]
+	--[ RevealEphemeralKey(public_key) ]->
+		// Output the private key to the network
+		// and thus make it available to the attacker
+		[ Out(~private_key) ]
+
+/* ---Initialization Phase--- */
+
+/* The initialization step for the TA
+ *
+ * In practice, this occurs simultaneously with the ta_first_message
+ * rule. We split them up for readability.
+ */
+rule initialize_ta:
+	let
+		// Put these here to make sure that 'difficult' public keys are used
+		ta_public_s = 'g'^~ta_private_s
+		server_public_s = 'g'^~server_private_s
+
+		// Start by setting the agreed upon protocol and prologue
+		h1 = h('PROTOCOL_NAME')
+		ck1 = h1
+		h2 = h(<h1, prologue>)
+
+		// Initialize with the public key from the server
+		h3 = h(<h2, server_public_s>)
+	in
+		[
+			// Generate a fresh ID
+			Fr(~ta_id),
+			!KeyPair(ta_public_s, ~ta_private_s),
+
+			// We get the server's public key from the network. In practice,
+			// the insertion of the public key is often not controlled by the
+			// attacker. However, this gives the attacker more power to strenghten the
+			// proof.
+			In(server_public_s),
+
+			// We get the agreed prologue data from the network.
+			In(prologue)
+		]
+	--[
+		// Indicate that the TA has been setup
+		TASetup(~ta_id, ta_public_s, ~ta_private_s),
+
+		// Indicate that the TA has a static key that belongs to the public key
+		SetOwnStaticKey(~ta_id, ta_public_s),
+
+		// This is the same as above, but better for readability in the lemmas
+		HonestTA(~ta_id, ta_public_s),
+
+		// Save the state for the lemmas
+		TAInitialized(~ta_id, h3, ck1),
+		// Note that the static public key was accepted
+		AcceptStaticPubKey(~ta_id, server_public_s)
+	]->
+		[
+			!StaticKey(~ta_id, ta_public_s, ~ta_private_s),
+			TAInitializedState(~ta_id, h3, ck1, server_public_s)
+		]
+
+/* The initialization step for the attestation server
+ *
+ * In practice, this occurs simultaneously with the server_first_message
+ * rule. We split them up for readability.
+ */
+rule initialize_server:
+	let
+		// Put these here to make sure that 'difficult' public keys are used
+		server_public_s = 'g'^~server_private_s
+
+		// Start by setting the agreed upon protocol and prologue
+		h1 = h('PROTOCOL_NAME')
+		ck1 = h1
+		h2 = h(<h1, prologue>)
+
+		// Initialize with the public key from the server
+		h3 = h(<h2, server_public_s>)
+	in
+		[
+			// Generate a new server ID
+			Fr(~server_id),
+			!KeyPair(server_public_s, ~server_private_s),
+
+			// Input the prologue data
+			In(prologue)
+		]
+	--[
+		// Indicate that the server has been setup
+		ServerSetup(~server_id, server_public_s, ~server_private_s),
+
+		// Set the keys for the server
+		SetOwnStaticKey(~server_id, server_public_s),
+
+		// This is the same as above, but added for better
+		// readability in the lemmas
+		HonestServer(~server_id, server_public_s),
+
+		// Note that the server has been initialized with these values
+		ServerInitialized(~server_id, h3, ck1)
+		// That's all the server needs to do in this step
+	]->
+		[
+			// The server has setup a static key after this step
+			!StaticKey(~server_id, server_public_s, ~server_private_s),
+
+			ServerInitializedState(~server_id, h3, ck1)
+		]
+
+/* ---TA Messages--- */
+
+rule ta_first_message:
+	// -> e, es
+	let
+		// Put these here to make sure that 'difficult' public keys are used
+		ta_public_s = 'g'^~ta_private_s
+		ta_public_e = 'g'^~ta_private_e
+		server_public_s = 'g'^~server_private_s
+
+		// e
+		h4 = h(<h3, ta_public_e>)
+
+		// es
+		/// HKDF
+		dh_es = (server_public_s^~ta_private_e)
+		temp_k = hmac(ck1, dh_es)
+		ck2 = hmac(temp_k, '0x01')
+		k1 = hmac(temp_k, <ck2, '0x02'>)
+		n1 = '0'
+
+		// Encrypt optional payload
+		ciphertext1 = aead(k1, n1, h4, ~payload1)
+		h5 = h(<h4, ciphertext1>)
+		message = <ta_public_e, ciphertext1>
+	in
+		[
+			// Get a new private ephemeral key
+			Fr(~ta_private_e),
+			// Get the keypair from the TA
+			!StaticKey(~ta_id, ta_public_s, ~ta_private_s),
+			// Get the variables from the initialization
+			TAInitializedState(~ta_id, h3, ck1, server_public_s),
+			// We let the attacker control the payload here
+			// for a stronger attacker.
+			Fr(~payload1)
+		]
+	--[
+		// Note that the first message has been sent
+		SendMessage(~ta_id, 'payload1', ~payload1),
+		SendCiphertext(~ta_id, 'payload1', ciphertext1),
+
+		// Note that the TA has set their ephemeral key
+		SetOwnEphemeralKey(~ta_id, ta_public_e),
+
+		// Note that the TA has started running
+		RunningTA(~ta_id, ~ta_private_s),
+
+		// Note that these keys are used
+		TAKeyUsed(~ta_id, 'm1',	 k1, n1, h4)
+	]->
+		[
+			// The TA has set their ephemeral key for this session
+			!EphemeralKey(~ta_id, ta_public_e, ~ta_private_e),
+
+			// This is required as state for the TA's next message
+			TAAfterFirstMessageState(~ta_id, h5, ck2, k1),
+
+			// Send the message out to the network (and therefore attacker)
+			Out(message)
+		]
+
+rule ta_send_final_handshake_message:
+	//  -> s, se
+	let
+		// Put these here to make sure that 'difficult' public keys are used
+		ta_public_s = 'g'^~ta_private_s
+		ta_public_e = 'g'^~ta_private_e
+		server_public_s = 'g'^~server_private_s
+		server_public_e = 'g'^~server_private_e
+
+		// Receive the message from the server
+		message = <server_public_e, ciphertext2>
+
+		// e from the Server
+		h6 = h(<h5, server_public_e>)
+
+		// ee from the Server
+		dh_ee = (server_public_e^~ta_private_e)
+
+		/// HKDF
+		temp_k2 = hmac(ck2, dh_ee)
+		ck3 = hmac(temp_k2, '0x01')
+		k2 = hmac(temp_k2, <ck3, '0x02'>)
+		n2 = '0'
+
+		// Decrypt the message from the Server
+		payload2 = decrypt(ciphertext2, k2, n2, h6)
+		n3 = '1'
+		h7 = h(<h6, ciphertext2>)
+
+		// Create the message towards the Server
+		// s from the TA
+		encrypted_ta_public_s = aead(k2, n3, h7, ta_public_s)
+		h8 = h(<h7, encrypted_ta_public_s>)
+
+		// se
+		sh_se = (server_public_e^~ta_private_s)
+		/// HKDF
+		temp_k3 = hmac(ck3, sh_se)
+		ck4 = hmac(temp_k3, '0x01')
+		k3 = hmac(temp_k3, <ck4, '0x02'>)
+		n4 = '0'
+
+		// Encrypt payload
+		ciphertext3 = aead(k3, n4, h8, ~payload3)
+		h9 = h(<h8, ciphertext3>)
+		n5 = '1'
+
+		// Construct the message
+		message = <encrypted_ta_public_s, ciphertext3>
+
+		// Now the protocol is done and we need
+		// to 'split' the cipherstate
+		/// HKDF
+		temp_k4 = hmac(ck4, '0')
+		cipherstate1_k = hmac(temp_k4, '0x01')
+		cipherstate2_k = hmac(temp_k4, <cipherstate1_k, '0x02'>)
+		cipherstate1_n = '0'
+		cipherstate2_n = '0'
+	in
+		[
+			// Get the TA's keys
+			!StaticKey(~ta_id, ta_public_s, ~ta_private_s),
+			!EphemeralKey(~ta_id, ta_public_e, ~ta_private_e),
+
+			// Get the variables from the previous rule
+			TAAfterFirstMessageState(~ta_id, h5, ck2, k1),
+
+			// Get the message
+			In(message),
+
+			// Generate a random payload
+			Fr(~payload3)
+		]
+	--[
+		// Verify the decryption step
+		Equal(verify(ciphertext2, k2, n2, h6), true),
+
+		// Note that the TA has accepted the server's public ephemeral key
+		AcceptEphemeralKey(~ta_id, server_public_e),
+
+		// Note that message 2 has been received
+		ReceiveMessage(~ta_id, 'payload2', payload2),
+		ReceiveCiphertext(~ta_id, 'payload2', ciphertext2),
+
+		// Note that message 3 has been sent
+		SendMessage(~ta_id, 'payload3', ~payload3),
+		SendCiphertext(~ta_id, 'payload3', ciphertext3),
+
+		// Note that the following keys were used
+		TAKeyUsed(~ta_id, 'm2', k2, n2, h6),
+		TAKeyUsed(~ta_id, 'm3', k2, n3, h7),
+		TAKeyUsed(~ta_id, 'm4', k3, n4, h8),
+
+		// Note the eventual state of the TA after the handshake
+		TAKeysFinal(~ta_id, cipherstate1_k, cipherstate2_k, cipherstate1_n, cipherstate2_n, h9)
+	]->
+		[
+			// Note the hash after everything is done
+			TAHandshakeDoneState(~ta_id, h9),
+
+			// After the handshake we have these 2 cipherstates
+			TACipherState1(~ta_id, cipherstate1_k, cipherstate1_n),
+			TACipherState2(~ta_id, cipherstate2_k, cipherstate2_n),
+
+			// Send the message to the network
+			Out(message)
+		]
+
+/* ---Server Messages--- */
+
+rule server_first_message:
+		// <- e, ee
+		let
+			// Put these here to make sure that 'difficult' public keys are used
+			ta_public_s = 'g'^~ta_private_s
+			ta_public_e = 'g'^~ta_private_e
+			server_public_s = 'g'^~server_private_s
+			server_public_e = 'g'^~server_private_e
+
+			// Receive message from the TA
+			// e from the TA
+			h4 = h(<h3, ta_public_e>)
+
+			/// HKDF
+			dh_es = (ta_public_e^~server_private_s)
+			temp_k = hmac(ck1, dh_es)
+			ck2 = hmac(temp_k, '0x01')
+			k1 = hmac(temp_k, <ck2, '0x02'>)
+			n1 = '0'
+
+			// Decrypt the payload from the TA
+			payload1 = decrypt(ciphertext1, k1, n1, h4)
+			h5 = h(<h4, ciphertext1>)
+
+			// Now start the actual response message
+			// e
+			h6 = h(<h5, server_public_e>)
+
+			// ee
+			dh_ee = (ta_public_e^~server_private_e)
+			/// HKDF
+			temp_k2 = hmac(ck2, dh_ee)
+			ck3 = hmac(temp_k2, '0x01')
+			k2 = hmac(temp_k2, <ck3, '0x02'>)
+			n2 = '0'
+
+			// Encrypt optional payload
+			ciphertext2 = aead(k2, n2, h6, ~payload2)
+			h7 = h(<h6, ciphertext2>)
+
+			// Create message
+			message = <server_public_e, ciphertext2>
+		in
+			[
+				// Generate a new private ephemeral key for the server
+				Fr(~server_private_e),
+
+				// Get the server's static keypair
+				!StaticKey(~server_id, server_public_s, ~server_private_s),
+
+				// Get the variables from the previous state
+				ServerInitializedState(~server_id, h3, ck1),
+
+				// Get the message from the network
+				In(<ta_public_e, ciphertext1>),
+
+				// Generate a random payload
+				Fr(~payload2)
+			]
+		--[
+			// Make sure that the encryption only 'passes' if
+			// the message is verified
+			Equal(verify(ciphertext1, k1, n1, h4), true),
+
+			// Note that the server received message 1 from the TA
+			ReceiveMessage(~server_id, 'payload1', payload1),
+			ReceiveCiphertext(~server_id, 'payload1', ciphertext1),
+
+			// Note that the server sent message 2 to the network
+			SendMessage(~server_id, 'payload2', ~payload2),
+			SendCiphertext(~server_id, 'payload2', ciphertext2),
+
+			// Note that the server is running the handshake now
+			RunningServer(~server_id, ~server_private_s),
+
+			// Accept the Ephemeral key from the TA
+			AcceptEphemeralKey(~server_id, ta_public_e),
+
+			// Note that the server uses a new ephemeral key
+			SetOwnEphemeralKey(~server_id, server_public_e),
+
+			// Note that the following keys were used in decryption and encryption
+			ServerKeyUsed(~server_id, 'm1', k1, n1, h4),
+			ServerKeyUsed(~server_id, 'm2', k2, n2, h6)
+		]->
+			[
+				// The server has generated a new ephemeral key
+				!EphemeralKey(~server_id, server_public_e, ~server_private_e),
+
+				// Save the state for the next rule from the server
+				ServerAfterFirstMessageState(~server_id, h7, ck3, k2),
+
+				// Send the message out to the network
+				Out(message)
+			]
+
+rule server_receive_final_handshake_message:
+	//  -> s, se
+	let
+		// Prevent 'attacks' with trivial public keys
+		ta_public_s = 'g'^~ta_private_s
+		ta_public_e = 'g'^~ta_private_e
+		server_public_s = 'g'^~server_private_s
+		server_public_e = 'g'^~server_private_e
+
+		// Receive the message from the TA
+		message = <encrypted_ta_public_s, ciphertext3>
+		ta_public_s = decrypt(encrypted_ta_public_s, k2, '1', h7)
+		h8 = h(<h7, encrypted_ta_public_s>)
+
+		// se
+		dh_se = (ta_public_s^~server_private_e)
+		/// HKDF
+		temp_k3 = hmac(ck3, dh_se)
+		ck4 = hmac(temp_k3, '0x01')
+		k3 = hmac(temp_k3, <ck4, '0x02'>)
+		n4 = '0'
+
+		// Decrypt payload
+		payload3 = decrypt(ciphertext3, k3, n4, h8)
+		h9 = h(<h8, ciphertext3>)
+
+		// Now the protocol is done and we need
+		// to 'split' the cipherstate
+		/// HKDF
+		temp_k4 = hmac(ck4, '0')
+		cipherstate1_k = hmac(temp_k4, '0x01')
+		cipherstate2_k = hmac(temp_k4, <cipherstate1_k, '0x02'>)
+		cipherstate1_n = '0'
+		cipherstate2_n = '0'
+	in
+		[
+			// Input the server's keys
+			!StaticKey(~server_id, server_public_s, ~server_private_s),
+			!EphemeralKey(~server_id, server_public_e, ~server_private_e),
+
+			// Get the state after the previous message
+			ServerAfterFirstMessageState(~server_id, h7, ck3, k2),
+
+			// Get the message from the network
+			In(message)
+		]
+	--[
+		// Verify the decryption step
+		Equal(verify(encrypted_ta_public_s, k2, '1', h7), true),
+		Equal(verify(ciphertext3, k3, n4, h8), true),
+
+		// Receive the message from the TA
+		ReceiveMessage(~server_id, 'payload3', payload3),
+		ReceiveCiphertext(~server_id, 'payload3', ciphertext3),
+
+		// Accept the static pubkey
+		AcceptStaticPubKey(~server_id, ta_public_s),
+
+		// Note which keys were used
+		ServerKeyUsed(~server_id, 'm3', k2, '1', h7),
+		ServerKeyUsed(~server_id, 'm4', k3, n4, h8),
+
+		// Note the final key set
+		ServerKeysFinal(~server_id, cipherstate1_k, cipherstate2_k, cipherstate1_n, cipherstate2_n, h9)
+	]->
+		[
+			// The final hash after everything is done
+			ServerHandshakeDoneState(~server_id, h9),
+
+			// The 2 cipherstates
+			ServerCipherState1(~server_id, cipherstate1_k, cipherstate1_n),
+			ServerCipherState2(~server_id, cipherstate2_k, cipherstate2_n),
+
+			// Send the message out to the network
+			Out(message)
+		]
+
+/* ---Sanity Lemmas--- */
+
+lemma sanity_can_initialize: exists-trace
+	"
+	// We want to make sure that it is possible for server and TA to perform the
+	// same initialization.
+	(Ex ta_id server_id hash ck #i #j.
+		ServerInitialized(server_id, hash, ck) @i & TAInitialized(ta_id, hash, ck) @j) &
+		not (Ex s #i. RevealSecretKey(s) @i)
+	"
+
+lemma sanity_same_hash_is_same_key:
+	"
+	All ta_id server_id message_a message_b ka kb na nb ha hb #i #j.
+		TAKeyUsed(ta_id, message_a, ka, na, ha) @i &
+		ServerKeyUsed(server_id, message_b, kb, nb, hb) @j &
+		ha = hb
+		==>
+		ka = kb
+		// |
+		// (Ex e_pubkey #x. RevealEphemeralKey(e_pubkey) @x)
+	"
+
+lemma sanity_same_hash_is_same_key_final:
+	"
+	All ta_id server_id k1a k1b k2a k2b n1a n1b n2a n2b ha hb #i #j.
+		TAKeysFinal(ta_id, k1a, k2a, n1a, n2a, ha) @i &
+		ServerKeysFinal(server_id, k1b, k2b, n1b, n2b, hb) @j &
+		ha = hb
+	==>
+		k1a = k1b & k2a = k2b
+	"
+
+lemma sanity_do_not_reuse_keys_server:
+	"
+	// If a key is used twice by the server
+	All server_id message_a message_b k n hash #i #j.
+		ServerKeyUsed(server_id, message_a, k, n, hash) @i &
+		ServerKeyUsed(server_id, message_b, k, n, hash) @j
+	==>
+		// The time must be at the same moment (and thus the same key)
+		#i = #j
+	"
+
+lemma sanity_do_not_reuse_keys_ta:
+	"
+	// If a key is used twice by the server
+	All ta_id k n msga msgb hash #i #j.
+		TAKeyUsed(ta_id, msga, k, n, hash) @i &
+		TAKeyUsed(ta_id, msgb, k, n, hash) @j
+	==>
+		// The time must be at the same moment (and thus the same key)
+		#i = #j
+	"
+
+/* ---Security checks--- */
+
+// Lemma to check if the protocol is secure if no keys are stolen
+lemma security_ta_key_security_with_all_keys_secret:
+	"
+	// If the TA has set up some keys
+	All ta_id k1 k2 n1 n2 hash #i.
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i
+		// And the servers static secret key is safe
+		& (not Ex server_pubkey #x #y. AcceptStaticPubKey(ta_id, server_pubkey) @x & RevealSecretKey(server_pubkey) @y)
+		// And the servers ephemeral secret key is safe
+		& (not Ex server_e_pubkey #x #y. AcceptEphemeralKey(ta_id, server_e_pubkey) @x & RevealEphemeralKey(server_e_pubkey) @y)
+		// And the TA's ephemeral secret is safe
+		& (not Ex ta_e_pubkey #x #y. SetOwnEphemeralKey(ta_id, ta_e_pubkey) @x & RevealEphemeralKey(ta_e_pubkey) @y)
+		// And the TA's static secret key is safe
+		& (not Ex device_pubkey #x #y. SetOwnStaticKey(ta_id, device_pubkey) @x & RevealSecretKey(device_pubkey) @y)
+		// And the server is honest
+		& (Ex server_pubkey server_id #x #y. AcceptStaticPubKey(ta_id, server_pubkey) @x & HonestServer(server_id, server_pubkey) @y)
+	==>
+	// Then an attacker should not know the keys
+	((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_server_key_security_with_all_keys_secret:
+	"
+	// If the Server has set up some keys (and therefore concluded the handshake)
+	All server_id k1 k2 n1 n2 hash #i.
+		ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @i
+		// And the TA's secret key is still secure
+		& (not Ex ta_pubkey #x #y. AcceptStaticPubKey(server_id, ta_pubkey) @x & RevealSecretKey(ta_pubkey) @y)
+		// And the TA's ephemeral secret key is secure
+		& (not Ex ta_e_pubkey #x #y. AcceptEphemeralKey(server_id, ta_e_pubkey) @x & RevealEphemeralKey(ta_e_pubkey) @y)
+		// And the server's ephemeral is secure
+		& (not Ex server_e_pubkey #x #y. SetOwnEphemeralKey(server_id, server_e_pubkey) @x & RevealEphemeralKey(server_e_pubkey) @y)
+		// And the TA's static secret key is secure
+		& (not Ex server_pubkey #x #y. SetOwnStaticKey(server_id, server_pubkey) @x & RevealSecretKey(server_pubkey) @y)
+		// A malicious TA should not impact security in the real world, since the static public
+		// key should be verified before the session continues. Nevertheless, we need to include
+		// this here, since the attacker can impersonate the TA in theory
+		& (Ex ta_id ta_pubkey #x #y. AcceptStaticPubKey(server_id, ta_pubkey) @x & HonestTA(ta_id, ta_pubkey) @y)
+	==>
+		// Then an attacker should not know the keys for this session
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_forward_secrecy:
+	"
+	All server_id ta_id k1a k1b k2a k2b n1a n1b n2a n2b ha hb #ia #ja #ib #jb.
+		// If Server and TA have set up a session
+		ServerKeysFinal(server_id, k1a, k2a, n1a, n2a, ha) @ia & TAKeysFinal(ta_id, k1a, k2a, n1a, n2a, ha) @ja
+		// And another session at a later moment
+		& ServerKeysFinal(server_id, k1b, k2b, n1b, n2b, hb) @ib & TAKeysFinal(ta_id, k1b, k2b, n1b, n2b, hb) @jb
+		// And the keys for the second session are stolen
+		& ((Ex #k. K(k1b) @k) | (Ex #l. K(k2b) @l))
+		// While the static keys are still safe
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+	==>
+		// Then the keys from the first session should still be secure
+		((not Ex #x. K(k1a) @x) & (not Ex #y. K(k2a) @y))
+		// Or both Ephemeral Keys were lost
+		| ((Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l))
+	"
+
+lemma security_key_secrecy_with_server_eph_key_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (not Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_ta_eph_key_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (not Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_server_static_key_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (not Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (not Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_ta_static_key_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (not Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (not Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_ta_static_key_and_server_ephemeral_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (not Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_server_static_key_and_ephemeral_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (not Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_ta_static_key_and_server_static_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+		& (not Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (not Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+	"
+
+lemma security_key_secrecy_with_ta_ephemeral_key_and_server_ephemeral_lost:
+	"
+	All ta_id server_id k1 k2 n1 n2 hash #i #j.
+		// Assuming the TA and server have set up a connection and there was not a MITM attack
+		TAKeysFinal(ta_id, k1, k2, n1, n2, hash) @i & ServerKeysFinal(server_id, k1, k2, n1, n2, hash) @j
+		// And the following properties hold
+		& (not Ex ta_pubkey #k #l. AcceptStaticPubKey(server_id, ta_pubkey) @k & RevealSecretKey(ta_pubkey) @l)
+		& (not Ex server_pubkey #k #l. AcceptStaticPubKey(ta_id, server_pubkey) @k & RevealSecretKey(server_pubkey) @l)
+	==>
+		// Then the keys should be safe from a passive attacker
+		((not Ex #x. K(k1) @x) & (not Ex #y. K(k2) @y))
+		// Or both Ephemeral Keys were lost
+		| ((Ex ta_e_pubkey #k #l. AcceptEphemeralKey(server_id, ta_e_pubkey) @k & RevealEphemeralKey(ta_e_pubkey) @l)
+		& (Ex server_e_pubkey #k #l. AcceptEphemeralKey(ta_id, server_e_pubkey) @k & RevealEphemeralKey(server_e_pubkey) @l))
+	"
+
+/* ---Payload Secrecy Lemmas--- */
+
+/* The following lemma's prove that messages came from the 'expected' sender.
+ * That means that, unless keys have been compromised, the messages should be authentic.
+ */
+
+lemma payload_payload1_secrecy:
+	// We do this check from the the TA's POV since that is the most
+	// 'important' POV in this case, and also easier for Tamarin to checkr
+	"
+	All ta_id server_pubkey payload1 #i #j.
+		// If the TA sends payload1...
+		SendMessage(ta_id, 'payload1', payload1) @i
+		// And we accept the following keys
+		& AcceptStaticPubKey(ta_id, server_pubkey) @j
+		// And the TA's ephemeral key is safe
+		& (Ex ta_e_pubkey #m. SetOwnEphemeralKey(ta_id, ta_e_pubkey) @m & (not Ex #n. RevealEphemeralKey(ta_e_pubkey) @n))
+	==>
+		// Then an attacker should not know the contents
+		(not Ex #x. K(payload1) @x)
+		// Or the server's static key was stolen
+		| (Ex server_id #x #y. HonestServer(server_id, server_pubkey) @x & RevealSecretKey(server_pubkey) @y)
+		// Or the server belonging to the public key was not honest
+		| (not Ex server_id #x. HonestServer(server_id, server_pubkey) @x)
+	"
+
+lemma payload_payload2_secrecy:
+	"
+	All ta_id payload2 server_pubkey #i #j.
+		// If the TA receives payload2...
+		ReceiveMessage(ta_id, 'payload2', payload2) @i
+		// And we accept the following keys
+		& AcceptStaticPubKey(ta_id, server_pubkey) @j
+		// And the TA's ephemeral key is safe
+		& (Ex ta_e_pubkey #m. SetOwnEphemeralKey(ta_id, ta_e_pubkey) @m & (not Ex #n. RevealEphemeralKey(ta_e_pubkey) @n))
+		// And the TA's static key is safe
+		& (Ex ta_pubkey #m. SetOwnStaticKey(ta_id, ta_pubkey) @m & (not Ex #n. RevealSecretKey(ta_pubkey) @n))
+	==>
+		// Then an attacker should not know the contents
+		(not Ex #x. K(payload2) @x)
+		// Or the server's static key was stolen
+		| (Ex server_id #x #y. HonestServer(server_id, server_pubkey) @x & RevealSecretKey(server_pubkey) @y)
+		// Or the server belonging to the public key was not honest
+		| (not Ex server_id #x. HonestServer(server_id, server_pubkey) @x)
+	"
+
+lemma payload_payload3_secrecy:
+	// We do this check from the the TA's POV since that is the most
+	// 'important' POV in this case, and also easier for Tamarin to check
+	"
+	All ta_id payload3 server_pubkey #i #j.
+		// If the TA sends payload3...
+		SendMessage(ta_id, 'payload3', payload3) @i
+		// And we accept the following keys
+		& AcceptStaticPubKey(ta_id, server_pubkey) @j
+		// And the TA's ephemeral key is safe
+		& (Ex ta_e_pubkey #m. SetOwnEphemeralKey(ta_id, ta_e_pubkey) @m & (not Ex #n. RevealEphemeralKey(ta_e_pubkey) @n))
+		// And the TA's static key is safe
+		& (Ex ta_pubkey #m. SetOwnStaticKey(ta_id, ta_pubkey) @m & (not Ex #n. RevealSecretKey(ta_pubkey) @n))
+	==>
+		// Then an attacker should not know the contents
+		(not Ex #x. K(payload3) @x)
+		// Or the server's static key was stolen
+		| (Ex server_id #x #y. HonestServer(server_id, server_pubkey) @x & RevealSecretKey(server_pubkey) @y)
+		// Or the server belonging to the public key was not honest
+		| (not Ex server_id #x. HonestServer(server_id, server_pubkey) @x)
+	"
+
+end
